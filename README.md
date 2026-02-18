@@ -1,26 +1,29 @@
 # Smart Bookmark App
 
-A production-ready bookmark manager built with **Next.js 14 (App Router)**, **Supabase**, and **Tailwind CSS**. Users sign in with Google, privately manage their bookmarks, and see updates in real-time across all open tabs.
+A private bookmark manager where users sign in with Google, save URLs with titles, and see their list update instantly across open tabs. Built with Next.js, Supabase, and Tailwind CSS.
+
+Live demo: https://smart-bookmark-app-titf.vercel.app
 
 ---
 
-## Project Overview
+## What It Does
 
-Smart Bookmark App lets authenticated users save, view, and delete bookmarks. Every bookmark is private — enforced at the database level using Supabase Row Level Security (RLS). Changes propagate instantly across browser tabs via Supabase Realtime without a page refresh.
+You sign in with your Google account. You get a personal list of bookmarks — just a title and a URL. You can add them, delete them, and if you have the app open in two tabs, adding a bookmark in one tab makes it appear in the other immediately without refreshing.
+
+No one else can see your bookmarks. That's enforced at the database level, not just in the app code.
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| Framework | Next.js 14 (App Router) |
-| Auth | Supabase Auth — Google OAuth 2.0 only |
-| Database | Supabase Postgres |
-| Real-time | Supabase Realtime (postgres_changes) |
-| Security | Row Level Security (RLS) via `auth.uid()` |
-| Styling | Tailwind CSS |
-| Deployment | Vercel |
+| Layer | Choice | Why |
+|---|---|---|
+| Framework | Next.js 14 (App Router) | Server components handle auth checks before anything reaches the browser, which avoids the flash of unauthenticated content you get with purely client-side approaches |
+| Auth | Supabase + Google OAuth | No passwords to manage. Google handles identity, Supabase handles the session |
+| Database | Supabase Postgres | RLS policies sit inside Postgres itself — even if the app code had a bug, cross-user access would still be blocked |
+| Realtime | Supabase Realtime | WebSocket-based, built into the same client already being used for everything else |
+| Styling | Tailwind CSS | Faster to iterate without context-switching between files |
+| Deployment | Vercel | Zero config for Next.js, handles environment variables cleanly |
 
 ---
 
@@ -28,238 +31,213 @@ Smart Bookmark App lets authenticated users save, view, and delete bookmarks. Ev
 
 ```
 /app
-  layout.tsx              → Root layout (fonts, globals)
-  page.tsx                → Redirects to /dashboard or /login
+  layout.tsx              → Root layout, loads global CSS
+  page.tsx                → Checks session, redirects to /login or /dashboard
   /login
-    page.tsx              → Google sign-in button (client component)
+    page.tsx              → Google sign-in button
   /dashboard
-    page.tsx              → Server component: fetches user + initial bookmarks
-    BookmarkClient.tsx    → Client component: realtime, add, delete
+    page.tsx              → Server component: verifies auth, fetches initial bookmarks
+    BookmarkClient.tsx    → Client component: realtime updates, add, delete
   /auth
     /callback
-      route.ts            → OAuth code exchange → session cookie
+      route.ts            → Receives OAuth code, exchanges it for a session cookie
 /lib
   /supabase
-    client.ts             → Browser Supabase client (SSR-safe)
-    server.ts             → Server Supabase client (reads cookies)
-middleware.ts             → Session refresh + route protection
+    client.ts             → Browser-side Supabase client
+    server.ts             → Server-side Supabase client (reads cookies)
+proxy.ts                  → Runs on every request: refreshes session, protects routes
 ```
 
-### Request Flow
-
-1. User visits `/` → middleware checks session → redirect to `/login` or `/dashboard`
-2. On `/login`, clicking "Continue with Google" initiates OAuth with Supabase, redirecting to Google
-3. Google redirects back to `/auth/callback?code=...`
-4. The callback route exchanges the code for a session and sets a cookie
-5. User is redirected to `/dashboard`
-6. The dashboard server component fetches the authenticated user and their bookmarks
-7. `BookmarkClient` mounts and opens a Supabase Realtime channel filtered to `user_id=eq.<uid>`
+There are two separate Supabase clients — one for the browser and one for the server. They look similar but serve different purposes. The server client reads the session from cookies on each request. The browser client handles the OAuth flow and opens the realtime connection. Using the wrong one in the wrong place causes the session to silently disappear.
 
 ---
 
-## How Real-Time Works
+## How Login Works
 
-Supabase Realtime streams Postgres WAL (Write-Ahead Log) changes over WebSocket to connected clients.
+1. You click "Continue with Google"
+2. Supabase redirects you to Google's login page
+3. After you approve, Google sends you back to Supabase
+4. Supabase redirects to `/auth/callback` on this app with a short-lived code
+5. The callback route exchanges that code for a real session and saves it in an HttpOnly cookie
+6. You land on `/dashboard`
 
-In `BookmarkClient.tsx`:
+The session lives in a cookie, not localStorage. This means it works across tabs, survives page refreshes, and isn't accessible to JavaScript running on the page.
+
+---
+
+## How Privacy Works (RLS)
+
+Every bookmark row has a `user_id` column. Supabase's Row Level Security (RLS) uses that to enforce access at the database level:
+
+```sql
+-- You can only read your own rows
+CREATE POLICY "select_own" ON public.bookmarks
+  FOR SELECT USING (auth.uid() = user_id);
+
+-- You can only insert rows where user_id matches your own ID
+CREATE POLICY "insert_own" ON public.bookmarks
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+-- You can only delete your own rows
+CREATE POLICY "delete_own" ON public.bookmarks
+  FOR DELETE USING (auth.uid() = user_id);
+```
+
+`auth.uid()` reads the JWT from the request and returns the logged-in user's ID. The `WITH CHECK` on INSERT means even if someone tampered with the request and sent a different `user_id`, Postgres would reject it. The app code doesn't need to handle this — the database does.
+
+---
+
+## How Realtime Works
+
+When you open the dashboard, a WebSocket connection opens to Supabase. It listens for changes to the bookmarks table, but only for your rows:
 
 ```ts
-const channel = supabase
+supabase
   .channel(`bookmarks:${user.id}`)
   .on("postgres_changes", {
     event: "INSERT",
     schema: "public",
     table: "bookmarks",
-    filter: `user_id=eq.${user.id}`,   // Server-side filter — only your rows
+    filter: `user_id=eq.${user.id}`,
   }, (payload) => {
-    setBookmarks(prev => [payload.new as Bookmark, ...prev]);
+    setBookmarks(prev => {
+      if (prev.some(b => b.id === payload.new.id)) return prev;
+      return [payload.new as Bookmark, ...prev];
+    });
   })
-  .on("postgres_changes", { event: "DELETE", ... }, (payload) => {
-    setBookmarks(prev => prev.filter(b => b.id !== payload.old.id));
-  })
-  .subscribe();
 ```
 
-- The `filter` parameter ensures only the current user's changes are streamed — not other users'
-- Subscriptions are cleaned up on component unmount via `supabase.removeChannel(channel)`
-- Optimistic updates are applied immediately, with realtime deduplication preventing double-renders
+The `filter` is applied server-side — Supabase only sends events for your rows. The deduplication check (`prev.some(...)`) handles the case where the optimistic update and the realtime event arrive close together, which would otherwise cause the same bookmark to appear twice.
+
+When the component unmounts, the channel is closed via `supabase.removeChannel(channel)`.
 
 ---
 
-## How Row Level Security (RLS) Works
+## Problems I Ran Into
 
-RLS is enforced at the Postgres level — the application layer cannot bypass it.
+**Node.js and npm not being recognized after install**
+
+After installing Node.js, the terminal still couldn't find `npm`. The fix was closing and fully reopening VS Code so it picked up the updated PATH. On Windows, the terminal inherits environment variables at launch — if Node was installed while it was already open, it won't see the new PATH until restarted.
+
+**PowerShell blocking npm scripts**
+
+Running `npm install` threw a security error about scripts being disabled. Windows PowerShell has execution policies that block scripts by default. Fixed by running `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` in an Administrator PowerShell window.
+
+**File structure — Next.js App Router conventions**
+
+The App Router requires specific filenames in specific folders (`page.tsx`, `layout.tsx`, `route.ts`). Files in the right folder but with the wrong name just produce a 404 with no helpful error. After downloading the project files, several ended up loose in the root folder instead of inside the `app/` directory. The app wouldn't start until every file was in the right place with the right name.
+
+**Middleware redirect loop**
+
+After login, the app kept bouncing between `/login` and `/dashboard` in a loop. The root cause was that the session cookie wasn't being saved properly after the OAuth exchange. The proxy (middleware) was reading the session on every request but the `setAll` function wasn't fully implemented, so the refreshed token never got written back. Once both `getAll` and `setAll` were wired up correctly in the server client, the loop stopped.
+
+**Invalid API key error during OAuth**
+
+After Google login, the auth callback kept failing with "Invalid API key". The `.env.local` file had placeholder text instead of the real Supabase anon key. Supabase recently renamed this key from "anon key" to "Publishable Key" in their dashboard — finding it required looking under the new label.
+
+**TypeScript errors blocking the Vercel build**
+
+The app ran fine locally but failed to build on Vercel. The strict TypeScript compiler on Vercel rejected the `cookiesToSet` parameter in several files because it had an implicit `any` type. Locally this passed because `strict` mode wasn't fully enforced the same way. Fixed by adding an explicit type annotation:
+```ts
+setAll(cookiesToSet: { name: string; value: string; options?: object }[])
+```
+This needed to be applied in three separate files: `server.ts`, `route.ts`, and `proxy.ts`.
+
+**OAuth redirecting to localhost after Vercel deployment**
+
+After deploying to Vercel, clicking "Continue with Google" redirected back to `localhost:3000` instead of the live URL. The Supabase "Site URL" setting was still pointing to localhost. Updating it to the Vercel deployment URL fixed the redirect.
+
+**Date formatting hydration mismatch**
+
+React flagged a hydration error because the server formatted dates differently from the client based on system locale. The server rendered "18 Feb 2026" and the browser rendered "Feb 18, 2026". Fixed by passing an explicit locale (`"en-US"`) to `toLocaleDateString()` so both sides produce the same output.
+
+---
+
+## Database Schema
 
 ```sql
--- Only the authenticated user's rows are returned
-CREATE POLICY "Users can view their own bookmarks"
-  ON public.bookmarks FOR SELECT
-  USING (auth.uid() = user_id);
-
-CREATE POLICY "Users can insert their own bookmarks"
-  ON public.bookmarks FOR INSERT
-  WITH CHECK (auth.uid() = user_id);
-
-CREATE POLICY "Users can delete their own bookmarks"
-  ON public.bookmarks FOR DELETE
-  USING (auth.uid() = user_id);
+CREATE TABLE public.bookmarks (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  title      TEXT NOT NULL,
+  url        TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
-`auth.uid()` is a Supabase function that reads the JWT sent with every request and returns the authenticated user's UUID. Even if a malicious client sends `user_id` of another user, the `WITH CHECK` clause rejects the insert.
-
----
-
-## Problems Encountered & Solutions
-
-| Problem | Solution |
-|---|---|
-| OAuth redirect URIs must match exactly | Added both `localhost` and Vercel URLs to Google Cloud Console and Supabase Auth settings |
-| Supabase cookies not available in Server Components after redirect | Used `@supabase/ssr` with the correct `setAll`/`getAll` cookie interface; middleware refreshes the session token on every request |
-| Realtime receiving events from other users | Used the `filter` parameter on `postgres_changes` to scope events to `user_id=eq.<uid>` |
-| Double-render on optimistic insert + realtime event | Added deduplication: `if (prev.some(b => b.id === newBookmark.id)) return prev` |
-| `cookies()` is async in Next.js 14.2+ | Awaited `cookies()` in `lib/supabase/server.ts` and the auth callback route |
+`user_id` references Supabase's internal auth table. `ON DELETE CASCADE` means if someone deletes their account, their bookmarks go with it automatically.
 
 ---
 
 ## Local Setup
 
-### Prerequisites
-
-- Node.js 18+
-- A Supabase project (free tier works)
-- A Google Cloud Console project
-
-### 1. Clone & install
+**Requirements:** Node.js 18+, a Supabase project, a Google Cloud project
 
 ```bash
-git clone https://github.com/your-username/smart-bookmark-app
+git clone https://github.com/Lokesh4VIT/smart-bookmark-app
 cd smart-bookmark-app
 npm install
 ```
 
-### 2. Configure Supabase
-
-1. Go to [supabase.com](https://supabase.com) → create a new project
-2. Navigate to **SQL Editor** and run the contents of `database.sql`
-3. Navigate to **Database → Replication** and enable replication for the `bookmarks` table (or the SQL file does this automatically)
-
-### 3. Configure Google OAuth
-
-**In Google Cloud Console:**
-1. Go to [console.cloud.google.com](https://console.cloud.google.com) → APIs & Services → Credentials
-2. Create an OAuth 2.0 Client ID (Web application)
-3. Add Authorized Redirect URIs:
-   ```
-   https://your-project-id.supabase.co/auth/v1/callback
-   ```
-4. Copy the **Client ID** and **Client Secret**
-
-**In Supabase Dashboard:**
-1. Go to **Authentication → Providers → Google**
-2. Enable Google
-3. Paste your **Client ID** and **Client Secret**
-4. Add your site URL under **Authentication → URL Configuration**:
-   - Site URL: `http://localhost:3000` (local) or `https://your-app.vercel.app` (prod)
-   - Redirect URLs: `http://localhost:3000/auth/callback` and `https://your-app.vercel.app/auth/callback`
-
-### 4. Create environment file
-
-```bash
-cp .env.local.example .env.local
+Create `.env.local` in the root folder:
 ```
-
-Fill in your values from **Supabase → Settings → API**:
-
-```env
 NEXT_PUBLIC_SUPABASE_URL=https://your-project-id.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-publishable-key
 ```
 
-### 5. Run locally
-
+Run the SQL in `database.sql` via the Supabase SQL editor, then:
 ```bash
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000)
+**Note for Windows users:** If `npm` is not recognized after installing Node.js, close and reopen your terminal. If you get a script execution error, run this in PowerShell as Administrator:
+```
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
 
 ---
 
-## Production Deployment (Vercel)
+## Supabase Configuration
 
-### 1. Push to GitHub
+**Google OAuth:**
+- Authentication → Providers → Google → enable, paste Client ID and Secret
+- In Google Cloud Console: APIs & Services → Credentials → OAuth 2.0 Client ID → add authorized redirect URI:
+  ```
+  https://your-project-id.supabase.co/auth/v1/callback
+  ```
 
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-git remote add origin https://github.com/your-username/smart-bookmark-app
-git push -u origin main
-```
+**URL Configuration:**
+- Authentication → URL Configuration
+- Site URL: `http://localhost:3000` for local, your Vercel URL for production
+- Redirect URLs: `http://localhost:3000/**` and `https://your-app.vercel.app/**`
 
-### 2. Deploy to Vercel
+---
 
-1. Go to [vercel.com](https://vercel.com) → New Project → Import your GitHub repo
-2. Add environment variables in the Vercel dashboard:
+## Vercel Deployment
+
+1. Push to GitHub
+2. Import repo at vercel.com
+3. Add environment variables:
    - `NEXT_PUBLIC_SUPABASE_URL`
    - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-3. Deploy — Vercel will auto-detect Next.js settings
-
-### 3. Update OAuth Redirect URLs
-
-After deployment, update:
-
-**In Supabase → Authentication → URL Configuration:**
-- Add: `https://your-app.vercel.app/auth/callback`
-- Site URL: `https://your-app.vercel.app`
-
-**In Google Cloud Console → OAuth 2.0 Client:**
-- Authorized Redirect URIs already point to Supabase's callback URL — no change needed unless you changed the Supabase project
-
-### 4. Verify
-
-- Open your Vercel URL
-- Sign in with Google
-- Add a bookmark
-- Open a second tab — the bookmark should appear instantly without refresh
-
----
-
-## Folder Structure
-
-```
-smart-bookmark-app/
-├── app/
-│   ├── auth/
-│   │   └── callback/
-│   │       └── route.ts          # OAuth code exchange
-│   ├── dashboard/
-│   │   ├── BookmarkClient.tsx    # Client: realtime + CRUD
-│   │   └── page.tsx              # Server: auth guard + initial fetch
-│   ├── login/
-│   │   └── page.tsx              # Google sign-in
-│   ├── globals.css
-│   ├── layout.tsx
-│   └── page.tsx                  # Root redirect
-├── lib/
-│   └── supabase/
-│       ├── client.ts             # Browser client
-│       └── server.ts             # Server client
-├── middleware.ts                 # Session refresh + route protection
-├── database.sql                  # Table + RLS policies
-├── .env.local.example
-├── next.config.js
-├── tailwind.config.js
-├── tsconfig.json
-└── package.json
-```
+4. Deploy
+5. After deployment, update Supabase Site URL to your Vercel URL and add it to Redirect URLs
 
 ---
 
 ## Security Notes
 
-- No email/password auth — Google OAuth only
-- JWTs are stored in HttpOnly cookies via `@supabase/ssr`
-- RLS policies prevent any cross-user data access, even with a valid anon key
-- The anon key is safe to expose publicly — it has no privilege without a valid user JWT
-- All bookmark operations are scoped to the authenticated user via `auth.uid()`
+The anon key is visible in the browser — this is expected. It only grants what RLS policies allow, and every policy requires a valid authenticated session. Without one, it returns nothing.
+
+Sessions are in HttpOnly cookies, not localStorage, so they can't be read by JavaScript on the page.
+
+There is no UPDATE policy on the bookmarks table. Users can create and delete but not edit — which matches the current feature set and removes an attack surface that isn't needed.
+
+---
+
+## What I'd Add Next
+
+- Search and filtering by title or domain
+- Folders or collections to group bookmarks
+- A browser extension to save the current tab in one click
+- Better mobile layout — it works but wasn't the focus
